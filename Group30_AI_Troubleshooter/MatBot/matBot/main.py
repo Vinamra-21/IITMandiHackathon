@@ -534,6 +534,8 @@ def render_auth_interface():
 #         # Close the chat container
 #         st.markdown('</div>', unsafe_allow_html=True)
 
+# =========================================================================
+
 def render_chat_history():
     """Render messages for the currently selected chat only, with special formatting for MATLAB code."""
     current_session = st.session_state.current_session
@@ -734,7 +736,9 @@ def render_chat_history():
         # Close the chat container
         st.markdown('</div>', unsafe_allow_html=True)
 
-# =======================================================================================
+# # =======================================================================================
+
+# ==========================================================================================
  
 def process_uploaded_file(uploaded_file):
     """Process an uploaded file and extract text/context from it."""

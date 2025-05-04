@@ -1,11 +1,14 @@
 import torch
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
-from langchain_huggingface import HuggingFaceEmbeddings  # Updated import
-from langchain_chroma import Chroma  # Updated import
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 from langchain.schema import Document
 from langchain_community.document_loaders import WikipediaLoader
 from langchain_community.tools.tavily_search import TavilySearchResults
+import os
+import pandas as pd
+from collections import Counter
 
 # -------------------- Load Embeddings + Chroma Vectorstore --------------------
 def load_embedding_model(persist_dir="MatBot/server/Embed-all-Act/chroma_index"):
@@ -85,9 +88,8 @@ def load_mistral_model(model_id="mistralai/Mistral-7B-Instruct-v0.2", use_4bit=T
         raise RuntimeError(f"Failed to load Mistral model: {e}")
 
 # -------------------- Prompt Formatter --------------------
-from typing import Optional
-
-def format_prompt(question: str, context: str, additional_web_context: Optional[str] = None) -> str:
+def format_prompt(question: str, context: str, additional_web_context: Optional[str] = None, 
+                  source_files: Optional[List[str]] = None) -> str:
     """
     Creates a well-structured prompt for the Mistral model that will return nicely formatted Markdown.
     
@@ -95,6 +97,7 @@ def format_prompt(question: str, context: str, additional_web_context: Optional[
         question (str): User's question.
         context (str): Documentation context.
         additional_web_context (Optional[str]): Additional context from web search.
+        source_files (Optional[List[str]]): List of source files used for context.
     
     Returns:
         str: Formatted prompt that encourages structured Markdown responses.
@@ -111,6 +114,16 @@ def format_prompt(question: str, context: str, additional_web_context: Optional[
         ```
         """
     
+    sources_section = ""
+    if source_files:
+        unique_sources = list(set(source_files))
+        sources_section = f"""
+        ## Information Sources:
+        
+        The following documentation files were used to answer this question:
+        {', '.join(unique_sources)}
+        """
+    
     return f"""<s>[INST] You are an expert technical assistant specializing in MATLAB, programming, and data analysis. 
 
             System Instructions:
@@ -122,6 +135,8 @@ def format_prompt(question: str, context: str, additional_web_context: Optional[
             6. Format your response in well-structured Markdown to make it easily readable on the web.
             7. Focus on technical accuracy and precision.
             8. While responding write only the MATLAB code in '```' code block.
+            9. Do not include any other text in the code block.
+            10. Ensure good formatting and readability in your response and have good spacing too.
             
 
             ## Documentation Context:
@@ -130,12 +145,13 @@ def format_prompt(question: str, context: str, additional_web_context: Optional[
             {cleaned_context}
             ```
             {web_context_section}
+            {sources_section}
             ## User Question: 
             {question} [/INST]
         """
 
 # -------------------- Query Database --------------------
-def query_database(query: str, embedding_model, vectorstore, k: int = 5) -> List[Document]:
+def query_database(query: str, embedding_model, vectorstore, k: int = 5) -> Tuple[List[Document], Dict]:
     """
     Queries the database for top-k similar documents.
     Args:
@@ -144,13 +160,23 @@ def query_database(query: str, embedding_model, vectorstore, k: int = 5) -> List
         vectorstore: Chroma vectorstore instance.
         k (int): Number of top results to return.
     Returns:
-        List[Document]: Top-k similar documents.
+        Tuple[List[Document], Dict]: Top-k similar documents and metadata stats.
     """
     print("🔎 Embedding user query and searching database...")
     embedded_query = embedding_model.embed_query(query)
     docs = vectorstore.similarity_search_by_vector(embedded_query, k=k)
     print(f"✅ Found {len(docs)} relevant documents")
-    return docs
+    
+    # Extract and analyze source metadata
+    source_files = [doc.metadata.get("source", "unknown") for doc in docs]
+    source_counter = Counter(source_files)
+    source_stats = {
+        "count": dict(source_counter),
+        "most_common": source_counter.most_common(3),
+        "unique_sources": list(source_counter.keys())
+    }
+    
+    return docs, source_stats
 
 # -------------------- Web Search Function --------------------
 def search_web(query: str, tavily_api_key: str) -> Dict[str, str]:
@@ -197,9 +223,51 @@ def search_web(query: str, tavily_api_key: str) -> Dict[str, str]:
     combined_context = "\n\n".join(filter(None, [wiki_context, web_context]))
     return {"context": combined_context}
 
+# -------------------- Format Metadata --------------------
+def format_metadata_summary(metadata_list, source_stats=None):
+    """
+    Creates a readable summary of metadata from source documents.
+    
+    Args:
+        metadata_list (List[Dict]): List of metadata dictionaries.
+        source_stats (Dict): Statistics about source files.
+        
+    Returns:
+        Dict: Formatted metadata summary.
+    """
+    # Extract all sources
+    sources = [meta.get("source", "unknown") for meta in metadata_list if meta]
+    
+    # Create summary
+    summary = {
+        "total_docs_used": len(metadata_list),
+        "unique_sources": list(set(sources)),
+        "source_frequency": dict(Counter(sources))
+    }
+    
+    if source_stats:
+        summary["source_stats"] = source_stats
+        
+    # Add page numbers if available
+    page_info = {}
+    for meta in metadata_list:
+        if meta and "source" in meta:
+            source = meta["source"]
+            page = meta.get("page", None)
+            if page:
+                if source not in page_info:
+                    page_info[source] = []
+                page_info[source].append(page)
+    
+    if page_info:
+        summary["page_information"] = page_info
+        
+    return summary
+
 # -------------------- Main Function --------------------
 def generate_response(user_query: str, embedding_model=None, vectorstore=None, model_pipeline=None, 
-                      tavily_api_key: str ="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", use_web_search: bool = False) -> str:
+                      tavily_api_key: str ="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", 
+                      use_web_search: bool = False, include_metadata_in_prompt: bool = True) -> Tuple[str, Dict]:
     """
     Generates a response to the user's query.
     Args:
@@ -209,8 +277,9 @@ def generate_response(user_query: str, embedding_model=None, vectorstore=None, m
         model_pipeline: Preloaded model pipeline.
         tavily_api_key (str): Tavily API key.
         use_web_search (bool): Whether to use web search.
+        include_metadata_in_prompt (bool): Whether to include source information in the prompt.
     Returns:
-        str: Generated response.
+        Tuple[str, Dict]: Generated response and metadata summary.
     """
     # Load models if not provided
     if embedding_model is None or vectorstore is None:
@@ -220,8 +289,14 @@ def generate_response(user_query: str, embedding_model=None, vectorstore=None, m
         model_pipeline = load_mistral_model()
 
     # Perform similarity search
-    top_docs = query_database(user_query, embedding_model, vectorstore, k=5)
+    top_docs, source_stats = query_database(user_query, embedding_model, vectorstore, k=5)
     combined_context = "\n".join(doc.page_content for doc in top_docs)
+    used_metadata = [doc.metadata for doc in top_docs]
+    source_files = [meta.get("source", "unknown") for meta in used_metadata if meta]
+    
+    # Format metadata for easy reading
+    metadata_summary = format_metadata_summary(used_metadata, source_stats)
+    print(f"📊 Metadata Summary: {metadata_summary}")
     
     # Perform web search if enabled
     web_context = ""
@@ -229,13 +304,13 @@ def generate_response(user_query: str, embedding_model=None, vectorstore=None, m
         web_results = search_web(user_query, tavily_api_key)
         web_context = web_results["context"]
     
-    # Create prompt
-    prompt = format_prompt(user_query, combined_context, web_context)
+    # Create prompt (optionally including source files)
+    source_list = source_files if include_metadata_in_prompt else None
+    prompt = format_prompt(user_query, combined_context, web_context, source_list)
     
     # Generate response
     print("🧠 Generating response...")
     result = model_pipeline(prompt)[0]['generated_text']
-    used_metadata = [doc.metadata for doc in top_docs]
     
     # Extract assistant's response
     response_start = result.find("[/INST]")
@@ -243,16 +318,48 @@ def generate_response(user_query: str, embedding_model=None, vectorstore=None, m
 
     # Format response to include code blocks
     response = response.replace("```", "<pre>").replace("```", "</pre>")
-    return response, used_metadata
+    
+    # Return both the response and the metadata summary
+    return response, metadata_summary
+
+# -------------------- Export Metadata to CSV --------------------
+def export_metadata_to_csv(metadata_summary, output_file="metadata_summary.csv"):
+    """
+    Exports metadata summary to a CSV file for analysis.
+    
+    Args:
+        metadata_summary (Dict): Metadata summary dictionary.
+        output_file (str): Output file path.
+    """
+    if not metadata_summary or "source_frequency" not in metadata_summary:
+        print("⚠️ No valid metadata to export")
+        return
+    
+    # Create DataFrame for source frequency
+    source_df = pd.DataFrame([
+        {"source": source, "frequency": count} 
+        for source, count in metadata_summary["source_frequency"].items()
+    ])
+    
+    # Save to CSV
+    source_df.to_csv(output_file, index=False)
+    print(f"✅ Metadata exported to {output_file}")
 
 # -------------------- Command Line Interface --------------------
 if __name__ == "__main__":
     tavily_api_key = "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"  # Replace with your API key or use os.getenv()
     use_web = input("🌐 Use web search? (y/n): ").strip().lower().startswith("y")
+    include_sources = input("📚 Include source files in prompt? (y/n): ").strip().lower().startswith("y")
+    
+    # Create output directory for metadata logs
+    os.makedirs("metadata_logs", exist_ok=True)
 
     # Load models once
     embedding_model, vectorstore = load_embedding_model()
     model_pipeline = load_mistral_model()
+
+    # Track session metadata for analysis
+    session_metadata = []
 
     while True:
         user_input = input("\n📝 Your question (or type 'q' to quit): ")
@@ -260,16 +367,40 @@ if __name__ == "__main__":
             print("👋 Exiting. Have a great day!")
             break
 
-        response, used_metadata = generate_response(
+        response, metadata_summary = generate_response(
             user_query=user_input,
             embedding_model=embedding_model,
             vectorstore=vectorstore,
             model_pipeline=model_pipeline,
-            use_web_search=use_web
+            use_web_search=use_web,
+            include_metadata_in_prompt=include_sources
         )
         print("\n🤖 Response:\n", response)
         
-        print("\n📄 Used Metadata:", used_metadata)
+        # Display source metadata in a readable format
+        print("\n📚 Source Information:")
+        if "unique_sources" in metadata_summary:
+            print(f"  - Documents used: {metadata_summary['total_docs_used']}")
+            print(f"  - Unique sources: {', '.join(metadata_summary['unique_sources'])}")
+            
+            print("\n  Source frequency:")
+            for source, count in metadata_summary["source_frequency"].items():
+                print(f"    • {source}: {count} chunks")
+                
+        # Save metadata for this query
+        session_metadata.append({
+            "query": user_input,
+            "metadata": metadata_summary
+        })
         
-
-        
+        # Export session metadata periodically
+        if len(session_metadata) % 5 == 0:
+            timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            export_metadata_to_csv(
+                metadata_summary, 
+                f"metadata_logs/metadata_summary_{timestamp}.csv"
+            )
+            
+    print("✅ All metadata exported. Goodbye!")
+    print(f"Sources used: {metadata_summary['unique_sources']}")
+    
