@@ -18,6 +18,8 @@
 
 - 🧮 Calculates confidence with *cosine similarity* from sklearn.metrics.pairwise.
 
+
+
 ## 🛠 Tech Stack
 - 🐍 *Python :*  The core programming language used for MATBOT. Python is ideal for AI/ML projects because of its rich ecosystem of libraries and frameworks.
 #####
@@ -47,6 +49,17 @@
 
 - 🔍 *Tavily API :* Used to pull real-time web search results when the internal documentation is insufficient. 
 
+
+## 📂 Dataset
+The dataset used for MATBOT includes:
+
+- 18 PDFs covering MATLAB troubleshooting topics from official documentation and third-party sources.
+
+- Scraped troubleshooting content from MATLAB forums and documentation pages.
+
+- Scraped Stack Overflow data, focusing on MATLAB-related questions and solutions.
+
+This combined dataset is embedded using retrieval-augmented generation (RAG) techniques to provide accurate and fast responses.
 
 ## 🚀 How It Works
 ![MATBOT Interface](MatBot/server/flowchart.png)
